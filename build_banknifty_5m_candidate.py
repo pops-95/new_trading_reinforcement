@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# v2: safe CUDA future-horizon reductions; no All-NaN slice warnings
+# v4: safe CUDA horizons + invalid parquet cleanup + robust DuckDB report
 from __future__ import annotations
 import argparse, gc, json, os, shutil
 from pathlib import Path
@@ -195,17 +195,68 @@ def side_labels(day,cands,p):
 
 def process_day(path,out,dmin,dmax,step):
  day=pd.read_parquet(path); dt(day); clean(day)
- if day.empty: atomic_parquet(day,out); return
+ if day.empty:
+  out.with_suffix(out.suffix+'.empty').write_text('no source rows\n',encoding='utf-8')
+  return
  c=select_candidates(day,dmin,dmax,step)
- if c.empty: atomic_parquet(c,out); return
+ if c.empty:
+  out.with_suffix(out.suffix+'.empty').write_text('no candidates\n',encoding='utf-8')
+  return
  for p in ('ce','pe'):
   l=side_labels(day,c,p); c=c.merge(l,on=['timestamp',f'{p}_groww_symbol'],how='left')
  atomic_parquet(c,out); del day,c; release()
 
+def valid_part(p):
+ try:
+  pf=pq.ParquetFile(p)
+  return len(pf.schema.names)>0 and pf.metadata is not None and pf.metadata.num_rows>0
+ except Exception:
+  return False
+
+def clean_invalid_parts(parts):
+ removed=[]
+ for p in sorted(parts.glob('day_*.parquet')):
+  if not valid_part(p):
+   try:
+    p.unlink()
+    removed.append(p.name)
+   except FileNotFoundError:
+    pass
+ return removed
+
 def combine(globstr,out,threads,mem,temp):
- c=db(threads,mem,temp); c.execute(f"COPY (SELECT * FROM read_parquet('{globstr.replace(chr(39),chr(39)*2)}') ORDER BY timestamp) TO '{q(out)}' (FORMAT PARQUET, COMPRESSION ZSTD)"); c.close()
+ c=db(threads,mem,temp)
+ src=globstr.replace(chr(39),chr(39)*2)
+ c.execute(f"COPY (SELECT * FROM read_parquet('{src}', union_by_name=true) ORDER BY timestamp) TO '{q(out)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+ c.close()
+
 def report(src,out,threads,mem,temp):
- c=db(threads,mem,temp); s=src.replace("'","''"); r=c.execute(f"""SELECT COUNT(*) AS row_count, AVG(CAST(ce_candidate_available AS DOUBLE)) ce_available_fraction, AVG(CAST(pe_candidate_available AS DOUBLE)) pe_available_fraction, AVG(CAST(ce_momentum_eligible AS DOUBLE)) ce_eligible_fraction, AVG(CAST(pe_momentum_eligible AS DOUBLE)) pe_eligible_fraction, AVG(CAST(label_ce_entry_valid AS DOUBLE)) ce_entry_valid_fraction, AVG(CAST(label_pe_entry_valid AS DOUBLE)) pe_entry_valid_fraction, AVG(CAST(chain_oi_available AS DOUBLE)) chain_oi_available_fraction FROM read_parquet('{s}')""").df().iloc[0].to_dict(); c.close(); r={k:(int(v) if k=='row_count' else float(v) if pd.notna(v) else None) for k,v in r.items()}; atomic_json(r,out/'candidate_quality_report.json'); return r
+ c=db(threads,mem,temp)
+ s=src.replace("'","''")
+ schema=c.execute(f"DESCRIBE SELECT * FROM read_parquet('{s}', union_by_name=true)").df()
+ available=set(schema['column_name'].tolist())
+
+ def avg(col,alias):
+  return f"AVG(CAST({col} AS DOUBLE)) AS {alias}" if col in available else f"NULL::DOUBLE AS {alias}"
+
+ query=f"""
+ SELECT
+  COUNT(*) AS row_count,
+  {avg('ce_candidate_available','ce_available_fraction')},
+  {avg('pe_candidate_available','pe_available_fraction')},
+  {avg('ce_momentum_eligible','ce_eligible_fraction')},
+  {avg('pe_momentum_eligible','pe_eligible_fraction')},
+  {avg('label_ce_entry_valid','ce_entry_valid_fraction')},
+  {avg('label_pe_entry_valid','pe_entry_valid_fraction')},
+  {avg('chain_oi_available','chain_oi_available_fraction')}
+ FROM read_parquet('{s}', union_by_name=true)
+ """
+ r=c.execute(query).df().iloc[0].to_dict()
+ c.close()
+ r={k:(int(v) if k=='row_count' else float(v) if pd.notna(v) else None) for k,v in r.items()}
+ atomic_json(r,out/'candidate_quality_report.json')
+ return r
+
 def manifest(sample,out):
  sch=pq.ParquetFile(sample).schema_arrow; ids={'timestamp','bar_start','groww_symbol','expiry_date','option_type','strike'}; m={}
  for f in sch:
@@ -237,8 +288,13 @@ def main():
    try:p.unlink()
    except FileNotFoundError:pass
   release()
- pf=sorted(parts.glob('day_*.parquet'))
- if not pf: raise RuntimeError('No candidate parts')
+ removed=clean_invalid_parts(parts)
+ if removed:
+  print(f'Removed {len(removed)} invalid/zero-column parquet part(s)')
+  for name in removed[:10]: print('  removed:',name)
+  if len(removed)>10: print(f'  ... and {len(removed)-10} more')
+ pf=[p for p in sorted(parts.glob('day_*.parquet')) if valid_part(p)]
+ if not pf: raise RuntimeError('No valid candidate parts')
  final=out/'candidate_dataset.parquet'
  if a.no_combine: src_report=str(parts/'day_*.parquet'); sample=pf[0]
  else:
